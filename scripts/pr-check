@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# pr-check: runs every pull_request workflow of the current repository locally with act
+# and publishes the result as the "pr-checks-local" commit status on the PR head, which
+# the develop rulesets of Grupo-Tarahumara require before merging.
+# The local checkout must sit exactly on the PR head with no uncommitted changes, because
+# act validates the files on disk, not the ones on GitHub. The status is tied to the head
+# SHA: new commits reset it, a title edit does not (re-run after renaming the PR).
+# Usage: pr-check [pr-number]   (defaults to the PR of the current branch)
+set -euo pipefail
+
+CONTEXT='pr-checks-local'
+cd "$(git rev-parse --show-toplevel)"
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+PR=${1:-$(gh pr view --json number -q .number)}
+SHA=$(gh api "repos/$REPO/pulls/$PR" -q .head.sha)
+
+if [ "$(git rev-parse HEAD)" != "$SHA" ]; then
+  echo "Tu copia local no está en el último commit del PR #$PR ($SHA)."
+  echo "Sube tus commits (git push) o trae los del PR (gh pr checkout $PR) y vuelve a intentar."
+  exit 1
+fi
+if ! git diff --quiet HEAD; then
+  echo "Tienes cambios sin commit. Haz commit o git stash antes de correr pr-check."
+  exit 1
+fi
+
+EVENT=$(mktemp)
+trap 'rm -f "$EVENT"' EXIT
+gh api "repos/$REPO/pulls/$PR" -q '{number: .number, pull_request: .}' > "$EVENT"
+git fetch -q origin
+
+if act pull_request -e "$EVENT" \
+  -P ubuntu-latest=catthehacker/ubuntu:act-latest \
+  --container-daemon-socket=unix:///var/run/docker.sock; then
+  STATE=success
+  DESCRIPTION='Revisión local con act aprobada'
+else
+  STATE=failure
+  DESCRIPTION='Revisión local con act fallida'
+fi
+
+gh api "repos/$REPO/statuses/$SHA" -f state="$STATE" -f context="$CONTEXT" \
+  -f description="$DESCRIPTION ($(git config user.email))" > /dev/null
+echo "PR #$PR ($SHA): $STATE"
+[ "$STATE" = success ]
